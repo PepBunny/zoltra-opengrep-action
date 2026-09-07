@@ -1,0 +1,151 @@
+# Zoltra managed Opengrep SAST workflow — DO NOT EDIT BY HAND.
+#
+# This file is owned by Zoltra and installed via a narrowly scoped setup
+# pull request (never written directly to the default branch by Zoltra).
+# Zoltra verifies the exact SHA-256 of this file after merge; any customer
+# edit is surfaced as `workflow_drift` and is never executed as managed
+# content. To update, merge a new Zoltra setup PR.
+#
+# Managed workflow version: 1
+# Release manifest:
+#   zoltra/infra/github-actions/release-manifest.json
+#
+# Security properties (spec
+# specs-zoltra-github-actions-opengrep-sast-transition-2026-09-07):
+# - manually dispatched by Zoltra only (`workflow_dispatch`); no push or
+#   pull-request triggers, so no implicit recurring Actions spend;
+# - no `pull_request_target`; scan steps never execute untrusted code with
+#   Zoltra secrets (the only secret used is the ephemeral GITHUB_TOKEN,
+#   confined to a read-only fetch of the pinned commit);
+# - checks out exactly `inputs.expected_sha` with credentials disabled;
+# - runs only the digest-pinned Zoltra scanner image and owned rule pack;
+# - uploads exactly one small sanitized artifact named with the request
+#   id, retained for one day; no SARIF, no raw engine output.
+
+name: Zoltra Opengrep SAST (managed)
+
+# Durable correlation anchor: the backend lists runs and matches the
+# `workflow_run` payload by this exact name.
+run-name: zoltra-sast-${{ inputs.request_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      request_id:
+        description: Zoltra SAST request id (correlation anchor)
+        required: true
+        type: string
+      expected_sha:
+        description: Exact 40-character commit SHA to scan
+        required: true
+        type: string
+      scan_mode:
+        description: Bounded scan mode (only "bounded" is accepted)
+        required: true
+        default: bounded
+        type: string
+
+# Minimal workflow-level permissions. Scan steps never write code,
+# branches, issues, or pull requests.
+permissions:
+  contents: read
+
+# Latest-request-wins: a repeated manual request cancels the earlier
+# queued run on the same ref instead of piling up.
+concurrency:
+  group: zoltra-sast-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Validate dispatch inputs (fail closed)
+        env:
+          ZOLTRA_REQUEST_ID: ${{ inputs.request_id }}
+          ZOLTRA_EXPECTED_SHA: ${{ inputs.expected_sha }}
+          ZOLTRA_SCAN_MODE: ${{ inputs.scan_mode }}
+        run: |
+          set -eu
+          if [ "$ZOLTRA_SCAN_MODE" != "bounded" ]; then
+            echo "reject: scan_mode must be 'bounded'" >&2
+            exit 1
+          fi
+          case "$ZOLTRA_EXPECTED_SHA" in
+            *[!0-9a-fA-F]* | "" )
+              echo "reject: expected_sha is not hex" >&2
+              exit 1
+              ;;
+          esac
+          if [ "${#ZOLTRA_EXPECTED_SHA}" -ne 40 ]; then
+            echo "reject: expected_sha must be 40 characters" >&2
+            exit 1
+          fi
+          case "$ZOLTRA_REQUEST_ID" in
+            "" | *[!A-Za-z0-9-]* )
+              echo "reject: request_id is not a bounded id" >&2
+              exit 1
+              ;;
+          esac
+          if [ "${#ZOLTRA_REQUEST_ID}" -gt 100 ]; then
+            echo "reject: request_id exceeds 100 characters" >&2
+            exit 1
+          fi
+
+      - name: Check out exactly the expected commit (no credentials persisted)
+        env:
+          ZOLTRA_EXPECTED_SHA: ${{ inputs.expected_sha }}
+          # Ephemeral token, used only to fetch the pinned commit and
+          # never persisted to git config.
+          ZOLTRA_FETCH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          git init -q repo
+          cd repo
+          git remote add origin "https://x-access-token:${ZOLTRA_FETCH_TOKEN}@github.com/${{ github.repository }}.git"
+          git fetch -q --depth 1 origin "$ZOLTRA_EXPECTED_SHA"
+          git checkout -q FETCH_HEAD
+          HEAD_SHA="$(git rev-parse HEAD)"
+          if [ "$HEAD_SHA" != "$ZOLTRA_EXPECTED_SHA" ]; then
+            echo "reject: fetched HEAD is not the expected commit" >&2
+            exit 1
+          fi
+          git remote remove origin
+          git config --unset credential.helper || true
+
+      - name: Run pinned Zoltra scanner image (owned rules only)
+        env:
+          ZOLTRA_REQUEST_ID: ${{ inputs.request_id }}
+          ZOLTRA_EXPECTED_SHA: ${{ inputs.expected_sha }}
+        run: |
+          set -eu
+          mkdir -p /tmp/zoltra-sast-out
+          # Digest-pinned immutable image; never a floating tag. The digest
+          # must match release-manifest.json `image_digest` exactly.
+          # Exit contract: the image exits 0 whenever it wrote the bounded
+          # artifact (findings, clean, AND partial) so this upload always
+          # runs for a completed scan; only a missing artifact exits
+          # nonzero, which fails the job into `not_scanned`.
+          # The engine needs a writable cache/temp: bounded tmpfs only
+          # (/scan stays read-only, no network, /out bounded to one file).
+          docker run --rm \
+            --network none \
+            --read-only \
+            --user "$(id -u):$(id -g)" \
+            --tmpfs /tmp:rw,nosuid,nodev,size=256m \
+            -v "${{ github.workspace }}/repo:/scan:ro" \
+            -v /tmp/zoltra-sast-out:/out \
+            -e ZOLTRA_REQUEST_ID \
+            -e ZOLTRA_EXPECTED_SHA \
+            -e ZOLTRA_REPOSITORY="${{ github.repository }}" \
+            "ghcr.io/pepbunny/zoltra-opengrep-sast@sha256:5437409d38a1eb376219e544de30e5107f1cb973ce9a37ab9dc98f2316f9798e"
+
+      - name: Upload bounded result artifact (1 day retention)
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4  # v5
+        with:
+          name: zoltra-sast-${{ inputs.request_id }}
+          path: /tmp/zoltra-sast-out/zoltra-sast-${{ inputs.request_id }}.json
+          retention-days: 1
+          if-no-files-found: error
