@@ -1,0 +1,45 @@
+# Owned Zoltra Opengrep rule pack for the GitHub Actions SAST lane.
+#
+# Identical semantics to zoltra/hermes/opengrep-rules/rules.yml at the
+# transition cutover: Zoltra-authored rules only (stable zoltra.sast.*
+# ids, static messages), no third-party rule content. The backend
+# validates result rule ids against this pack's ids; the image runs only
+# this pack. Keep both files in sync until the E2B retirement boundary
+# removes the runtime copy (after the Actions proof is green).
+
+rules:
+  - id: zoltra.sast.sql-string-format
+    languages: [python]
+    severity: WARNING
+    message: >-
+      Possible SQL statement built with string formatting. Use a
+      parameterized query instead of interpolating values into SQL text.
+    patterns:
+      - pattern-regex: '\.execute\s*\([^)]*%'
+
+  - id: zoltra.sast.hardcoded-secret
+    languages: [python]
+    severity: ERROR
+    message: >-
+      Possible hardcoded cloud credential in source. Move the secret to
+      the credential boundary and never commit secret values.
+    patterns:
+      - pattern-regex: '(?i)aws_secret_access_key\s*=\s*[''"][^''"]+[''"]'
+
+  - id: zoltra.sast.insecure-md5
+    languages: [python]
+    severity: WARNING
+    message: >-
+      MD5 is not a password hash. Use a dedicated password-hashing
+      function for credential material.
+    patterns:
+      - pattern-regex: 'hashlib\s*\.\s*md5\s*\('
+
+  - id: zoltra.sast.dom-xss-innerhtml
+    languages: [javascript, typescript]
+    severity: WARNING
+    message: >-
+      Possible DOM cross-site scripting sink. Do not assign untrusted
+      data to innerHTML; use a safe text or sanitizer API instead.
+    patterns:
+      - pattern-regex: '\.innerHTML\s*='
